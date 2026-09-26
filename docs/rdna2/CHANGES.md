@@ -774,7 +774,7 @@ fp16), with rel. error 8.4e-3 vs the exact sum, as before. It is also slightly *
 `VLLM_RDNA_AR_Q8_STAGGER=0` restores the grouped all-to-all. Whether staggering removes the bus drops is not yet
 known; it needs a heavy-load soak with `VLLM_RDNA_AR_Q8=1`.
 
-## 18. Wide-write one-shot all-reduce, `VLLM_RDNA_AR_MODE=wide` (2026-09-26, built, not yet tested)
+## 18. Wide-write one-shot all-reduce, `VLLM_RDNA_AR_MODE=wide` (2026-09-26)
 
 Both earlier modes of the small-message all-reduce put many tiny PCIe transactions on the bus from all four cards
 at the same moment, about 95 times per decode step. The p2p kernel (§6) stores one fp16 element per lane, i.e.
@@ -803,7 +803,23 @@ complexes must buffer. On our board both modes dropped V620s under a 4-worker so
 
 The selection is inside the extension, like `host`; the Python side is unchanged.
 
-**To do:** `tools/rdna2/ar_ops_test.py` with `VLLM_RDNA_AR_MODE=wide` (correctness, graph replay, timing vs p2p
-and RCCL), then a 4-worker heavy-load soak, three times. If it still drops
-cards, packet size is not the trigger, and the remaining difference from RCCL is the number of simultaneous flows
-(12 here against 4 in RCCL's ring); a ring-ordered variant would test that.
+**Op test** (`tools/rdna2/ar_ops_test.py`, 4× V620, fp16): exact and identical across ranks, eager and in a CUDA
+graph, at every size. Per all-reduce, in-graph:
+
+| message | wide | p2p |
+|---|---|---|
+| 5 KB | 16.6 µs | 13.6 µs |
+| 20 KB | 33.9 µs | 29.1 µs |
+| 60 KB | 59.7 µs | 54.3 µs |
+
+Wide is 7–20 % slower per call, probably because it launches fewer blocks (one pass). In-server single-stream decode
+is ~62 t/s, the same as p2p.
+
+**Soak.** 4-worker heavy load (fresh 2k–40k-token prefills, follow-ups, 64–512-token decodes), 120 W cap, int8
+prefill all-reduce off: three runs of 252, 281 and 263 s, 123 requests, **no errors and no GPU drop**. One SAS
+tape reset happened during the third run and all cards stayed up. The same load with host mode dropped a card in
+two of three runs (at 112 s and 205 s, ~170 W cap).
+
+Not yet shown: the same result at the higher power cap the host-mode drops happened at, and a longer or more
+decode-heavy load. If wide mode ever drops a card, the next variable is flow count (12 simultaneous flows against 4
+in RCCL's ring); a ring-ordered variant would test that.

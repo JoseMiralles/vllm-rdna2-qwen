@@ -395,7 +395,8 @@ full width; under RCCL, `NCCL_P2P_LEVEL=SYS` then `NCCL_P2P_DISABLE=1`. Experime
 `VLLM_RDNA_AR=0` that keep the fast path: `VLLM_RDNA_AR_MODE=host` (payload through pinned host
 memory, CHANGES #15) -- it still dropped cards on our board under a 4-worker soak; and
 `VLLM_RDNA_AR_MODE=wide` (16-byte stores forming whole 128-byte lines, no reads across the bus,
-CHANGES #18) -- new on 2026-09-26, not yet tested. **Verify:** after the
+CHANGES #18) -- passed three heavy-load soaks on our board where host mode had dropped cards,
+same decode speed as p2p; try it before giving up the fast path. **Verify:** after the
 fix, delete `$VLLM_CACHE_ROOT/rdna_ar_wedged`, boot, and confirm `rdna_ar: one-shot all-reduce
 active` with self-test timings well under 50 ms, then the workload that used to wedge.
 
