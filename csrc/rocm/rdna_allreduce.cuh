@@ -286,3 +286,132 @@ __global__ void rdna_ar_host_ll(const T* __restrict__ in, T* __restrict__ out,
     RdnaLL<T>::put(out, w * kPer, n, v);
   }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Wide-write variant (VLLM_RDNA_AR_MODE=wide, 2026-09-26). Same protocol and memory as the p2p
+// kernel above (push into the peers' uncached staging, one flag per peer, poll only our own
+// flags), but it controls the size of what goes over PCIe. The p2p kernel stores one fp16
+// element per lane -- 2-byte stores, which the GPU may or may not merge before they leave the card.
+// Each such write carries ~20-26 bytes of TLP framing and header on a Gen3 link, so tiny payloads
+// use a fraction of the link and multiply the number of packets the root complexes have to buffer.
+// Here every lane moves 16 bytes (one dwordx4 store), consecutive lanes cover consecutive 16-byte
+// pieces, so each group of 8 lanes fills one aligned 128-byte line and a wave writes 512 contiguous
+// bytes. Per collective and peer, a 20 KB message is 1280 16-byte stores forming 160 full lines (vs.
+// 10240 2-byte stores), plus ONE 4-byte flag. Nothing is ever read across the bus: the reduction
+// reads only our own staging.
+//
+// Ordering: every lane fences (system scope) after its pushes, before the block barrier, and the
+// flag store is a release -- the payload to a peer is posted before that peer's flag. Eligibility
+// (rdna_ar_can): message size a multiple of 16 bytes and 16-byte aligned input, so there is no
+// sub-16-byte tail; anything else goes to RCCL.
+template <typename T> struct RdnaVec;
+template <> struct RdnaVec<__half> {   // 8 halves per 16-byte vector
+  static constexpr int kPer = 8;
+  __device__ static void acc(float* v, const uint4& x) {
+    const unsigned w[4] = {x.x, x.y, x.z, x.w};
+    for (int k = 0; k < 4; k++) {
+      v[2 * k] += __half2float(__ushort_as_half((unsigned short)(w[k] & 0xFFFFu)));
+      v[2 * k + 1] += __half2float(__ushort_as_half((unsigned short)(w[k] >> 16)));
+    }
+  }
+  __device__ static uint4 pack(const float* v) {
+    unsigned w[4];
+    for (int k = 0; k < 4; k++)
+      w[k] = (unsigned)__half_as_ushort(__float2half(v[2 * k])) |
+             ((unsigned)__half_as_ushort(__float2half(v[2 * k + 1])) << 16);
+    return make_uint4(w[0], w[1], w[2], w[3]);
+  }
+};
+template <> struct RdnaVec<float> {    // 4 floats per 16-byte vector
+  static constexpr int kPer = 4;
+  __device__ static void acc(float* v, const uint4& x) {
+    v[0] += __uint_as_float(x.x); v[1] += __uint_as_float(x.y);
+    v[2] += __uint_as_float(x.z); v[3] += __uint_as_float(x.w);
+  }
+  __device__ static uint4 pack(const float* v) {
+    return make_uint4(__float_as_uint(v[0]), __float_as_uint(v[1]), __float_as_uint(v[2]), __float_as_uint(v[3]));
+  }
+};
+
+template <typename T>
+__global__ void rdna_ar_wide(const T* __restrict__ in, T* __restrict__ out,
+                             RdnaArPeers peers, unsigned int* arrive, int* seqbuf,
+                             unsigned* timeout, unsigned long long* report,
+                             int rank, int world, int nvec,   // 16-byte vectors in the message
+                             long long slot_vecs,             // 16-byte vectors per staging slot
+                             int nblocks, int pace, unsigned long long spin_cap) {
+  __shared__ int s_seq;
+  __shared__ int s_abort;
+  const int t = threadIdx.x, nt = blockDim.x, b = blockIdx.x;
+  if (t == 0) {
+    s_seq = __hip_atomic_load(seqbuf, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) + 1;
+    s_abort = 0;
+  }
+  __syncthreads();
+  const int seq = s_seq;
+  const int p = seq & 1;
+  const int gid = b * nt + t, gstride = nblocks * nt;
+  const uint4* in4 = reinterpret_cast<const uint4*>(in);
+
+  // 1. push our message into every peer's slot for us: 16 bytes per lane, whole 128-byte lines,
+  //    peers staggered by rank (one writer per destination at a time), optional pacing
+  for (int k = 1; k < world; k++) {
+    const int j = (rank + k) % world;
+    uint4* dst = reinterpret_cast<uint4*>(peers.stage[j]) + ((long long)p * world + rank) * slot_vecs;
+    for (int i = gid; i < nvec; i += gstride) {
+      dst[i] = in4[i];
+      for (int q = 0; q < pace; q++) __builtin_amdgcn_s_sleep(1);
+    }
+  }
+  __threadfence_system();   // every lane: its pushes are issued before the barrier below
+  __syncthreads();
+
+  // 2. grid barrier (all our blocks have pushed), announce with one flag per peer, wait locally
+  if (t == 0) {
+    atomicAdd(&arrive[p], 1u);
+    if (b == 0) {
+      unsigned long long s = 0;
+      while (__hip_atomic_load(&arrive[p], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) <
+             (unsigned)nblocks) {
+        RDNA_AR_POLL_PAUSE();
+        if (++s > spin_cap) { rdna_ar_abort(timeout, report, 1u, (unsigned)rank, seq, s); s_abort = 1; break; }
+      }
+      if (!s_abort) {
+        arrive[1 - p] = 0u;
+        __hip_atomic_store(seqbuf, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence_system();
+        for (int k = 0; k < world; k++) {           // same staggered order as the pushes
+          const int j = (rank + k) % world;
+          __hip_atomic_store(&peers.flags[j][rank], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+      }
+    }
+    if (!s_abort) {
+      // wait: poll OUR flag slots (local uncached memory -- no PCIe traffic while waiting)
+      int* myflags = peers.flags[rank];
+      for (int j = 0; j < world && !s_abort; j++) {
+        if (j == rank) continue;
+        unsigned long long s = 0;
+        while (__hip_atomic_load(&myflags[j], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+          RDNA_AR_POLL_PAUSE();
+          if (++s > spin_cap) { rdna_ar_abort(timeout, report, 2u, (unsigned)j, seq, s); s_abort = 1; break; }
+        }
+      }
+    }
+  }
+  __syncthreads();
+  if (s_abort) return;
+
+  // 3. fixed-order fp32 reduction (rank 0 .. W-1, the p2p kernel's order): local reads only
+  constexpr int kPer = RdnaVec<T>::kPer;
+  const uint4* mine = reinterpret_cast<const uint4*>(peers.stage[rank]) + ((long long)p * world) * slot_vecs;
+  uint4* out4 = reinterpret_cast<uint4*>(out);
+  for (int i = gid; i < nvec; i += gstride) {
+    float v[kPer];
+    for (int k = 0; k < kPer; k++) v[k] = 0.f;
+    for (int j = 0; j < world; j++)
+      RdnaVec<T>::acc(v, j == rank ? in4[i] : mine[(long long)j * slot_vecs + i]);
+    out4[i] = RdnaVec<T>::pack(v);
+  }
+}

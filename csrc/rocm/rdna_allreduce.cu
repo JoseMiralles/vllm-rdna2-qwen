@@ -49,6 +49,9 @@ struct RdnaArState {
   // VLLM_RDNA_AR_MODE=host (2026-09-25): payload through one shared pinned host buffer, no GPU
   // peer-to-peer at all (see rdna_ar_host_ll in rdna_allreduce.cuh). Default "p2p" = the kernel above.
   bool host_mode = false;
+  // VLLM_RDNA_AR_MODE=wide (2026-09-26): the p2p protocol and memory, but 16-byte stores per lane
+  // forming whole 128-byte lines (rdna_ar_wide in rdna_allreduce.cuh). Needs 16-byte multiples.
+  bool wide_mode = false;
   std::string shm_name;
   void* host_map = nullptr;                  // our mapping of the shared buffer
   size_t host_bytes = 0;
@@ -79,9 +82,15 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
   // idles each wave between strided stores. See rdna_allreduce.cuh step 1.
   if (const char* e = std::getenv("VLLM_RDNA_AR_BLOCKS")) g.blocks_cap = std::max(0, std::atoi(e));
   if (const char* e = std::getenv("VLLM_RDNA_AR_PACE")) g.pace = std::max(0, std::min(127, std::atoi(e)));
-  if (const char* e = std::getenv("VLLM_RDNA_AR_MODE")) g.host_mode = (std::string(e) == "host");
+  if (const char* e = std::getenv("VLLM_RDNA_AR_MODE")) {
+    g.host_mode = (std::string(e) == "host");
+    g.wide_mode = (std::string(e) == "wide");
+  }
   TORCH_CHECK(device_ids.numel() == world && device_ids.scalar_type() == at::kLong,
               "rdna_ar: device_ids must be int64[world]");
+  // wide mode: every staging slot must start on a 512-byte boundary so each wave's stores fill
+  // aligned 128-byte lines
+  TORCH_CHECK(!g.wide_mode || max_bytes % 512 == 0, "rdna_ar wide mode: max_bytes must be a multiple of 512");
   g.rank = (int)rank;
   g.world = (int)world;
   g.max_bytes = max_bytes;
@@ -178,9 +187,14 @@ void rdna_ar_connect(int64_t handle, const at::Tensor& handles) {
 
 bool rdna_ar_can(int64_t handle, const at::Tensor& t) {
   const RdnaArState& g = inst(handle);
-  return g.ready && t.is_cuda() && t.is_contiguous() &&
-         (t.scalar_type() == at::kHalf || t.scalar_type() == at::kFloat) &&
-         t.numel() * t.element_size() <= g.max_bytes && t.numel() > 0;
+  const bool ok = g.ready && t.is_cuda() && t.is_contiguous() &&
+                  (t.scalar_type() == at::kHalf || t.scalar_type() == at::kFloat) &&
+                  t.numel() * t.element_size() <= g.max_bytes && t.numel() > 0;
+  // wide mode moves whole 16-byte vectors only: no sub-16-byte tail, aligned input (else RCCL)
+  if (ok && g.wide_mode)
+    return (t.numel() * t.element_size()) % 16 == 0 &&
+           reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0;
+  return ok;
 }
 
 at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in) {
@@ -207,6 +221,24 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in) {
           reinterpret_cast<const float*>(in.const_data_ptr()),
           reinterpret_cast<float*>(out.mutable_data_ptr()), g.host_dev, g.arrive, g.seqbuf,
           g.timeout, g.report, g.rank, g.world, n, g.slot_words, nblocks, g.spin_cap);
+    g.fast_calls++;
+    return out;
+  }
+  if (g.wide_mode) {
+    // one 16-byte vector per lane per pass: no more blocks than it takes to cover the message once
+    const int nvec = (int)(bytes / 16);
+    nblocks = std::max(1, std::min(nblocks, (nvec + threads - 1) / threads));
+    const long long slot_vecs = g.max_bytes / 16;
+    if (in.scalar_type() == at::kHalf)
+      rdna_ar_wide<__half><<<nblocks, threads, 0, stream>>>(
+          reinterpret_cast<const __half*>(in.const_data_ptr()),
+          reinterpret_cast<__half*>(out.mutable_data_ptr()), g.peers, g.arrive, g.seqbuf,
+          g.timeout, g.report, g.rank, g.world, nvec, slot_vecs, nblocks, g.pace, g.spin_cap);
+    else
+      rdna_ar_wide<float><<<nblocks, threads, 0, stream>>>(
+          reinterpret_cast<const float*>(in.const_data_ptr()),
+          reinterpret_cast<float*>(out.mutable_data_ptr()), g.peers, g.arrive, g.seqbuf,
+          g.timeout, g.report, g.rank, g.world, nvec, slot_vecs, nblocks, g.pace, g.spin_cap);
     g.fast_calls++;
     return out;
   }

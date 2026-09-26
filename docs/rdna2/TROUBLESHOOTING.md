@@ -388,13 +388,14 @@ collective #s: peer rank j's flag never arrived …`, then the engine stops imme
 next boot logs `rdna_ar: disabled -- a previous run wedged on this machine` and runs on RCCL.
 Older builds show only the stall.
 
-**Fix, in order:** set `VLLM_RDNA_AR_MODE=host` (keeps the fast path, but stages the payload
-through one shared pinned host buffer, so no GPU writes into another GPU at all; same speed in
-the 4-GPU op test, ~32 us per 20 KB; CHANGES #15 -- new on 2026-09-25, not yet soak-tested); or
-run with `VLLM_RDNA_AR=0` (RCCL for the small collectives: about -26 % single-stream decode on
+**Fix, in order:** run with `VLLM_RDNA_AR=0` (RCCL for the small collectives: about -26 % single-stream decode on
 4x V620, 62 -> 46 t/s); disable ACS in the
 BIOS and put the IOMMU in passthrough (`iommu=pt`); move the cards onto one root complex at
-full width; under RCCL, `NCCL_P2P_LEVEL=SYS` then `NCCL_P2P_DISABLE=1`. **Verify:** after the
+full width; under RCCL, `NCCL_P2P_LEVEL=SYS` then `NCCL_P2P_DISABLE=1`. Experimental alternatives to
+`VLLM_RDNA_AR=0` that keep the fast path: `VLLM_RDNA_AR_MODE=host` (payload through pinned host
+memory, CHANGES #15) -- it still dropped cards on our board under a 4-worker soak; and
+`VLLM_RDNA_AR_MODE=wide` (16-byte stores forming whole 128-byte lines, no reads across the bus,
+CHANGES #18) -- new on 2026-09-26, not yet tested. **Verify:** after the
 fix, delete `$VLLM_CACHE_ROOT/rdna_ar_wedged`, boot, and confirm `rdna_ar: one-shot all-reduce
 active` with self-test timings well under 50 ms, then the workload that used to wedge.
 

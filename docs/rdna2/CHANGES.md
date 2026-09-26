@@ -773,3 +773,37 @@ fp16), with rel. error 8.4e-3 vs the exact sum, as before. It is also slightly *
 
 `VLLM_RDNA_AR_Q8_STAGGER=0` restores the grouped all-to-all. Whether staggering removes the bus drops is not yet
 known; it needs a heavy-load soak with `VLLM_RDNA_AR_Q8=1`.
+
+## 18. Wide-write one-shot all-reduce, `VLLM_RDNA_AR_MODE=wide` (2026-09-26, built, not yet tested)
+
+Both earlier modes of the small-message all-reduce put many tiny PCIe transactions on the bus from all four cards
+at the same moment, about 95 times per decode step. The p2p kernel (§6) stores one fp16 element per lane, i.e.
+2-byte writes into the peers' BARs, and relies on the GPU to merge them before they leave the card. The host kernel
+(§15) writes 8-byte words that are half tag, then reads the peers' data back across the bus. A PCIe Gen3 write
+carries ~20–26 bytes of framing and header, so small payloads waste the link and multiply the packets the root
+complexes must buffer. On our board both modes dropped V620s under a 4-worker soak (host mode twice on
+2026-09-26, once with the int8 prefill all-reduce off), and RCCL did not.
+
+`VLLM_RDNA_AR_MODE=wide` keeps the p2p protocol and memory layout, and controls transaction size explicitly:
+
+- **16 bytes per lane.** Each lane stores one dwordx4. Consecutive lanes cover consecutive 16-byte pieces, so every
+  8 lanes fill one aligned 128-byte line and a wave writes 512 contiguous bytes. Slots start on 512-byte
+  boundaries (`max_bytes` must be a multiple of 512). A 20 KB message is 1,280 16-byte stores (160 full lines) per
+  peer instead of 10,240 2-byte stores.
+- **Writes only.** Nothing is read across the bus. Each card pushes into its peers' uncached staging, fences, and
+  announces with one 4-byte flag per peer; the reduction reads only local staging.
+- **Local waiting.** Each card polls its own flag slots with backoff, so waiting puts no traffic on the bus.
+- **Unchanged:** peers staggered by rank (one writer per destination at a time), `VLLM_RDNA_AR_PACE`, two
+  parities, the same fixed-order fp32 reduction as the p2p kernel (so results should be bit-identical to it), the
+  on-device sequence counter, and the T44b bounded spins and abort record.
+- **Eligibility.** Only messages that are a multiple of 16 bytes from 16-byte-aligned tensors. Everything else goes
+  to RCCL. Decode messages (`batch × 2560` fp16) always qualify.
+- **Block count.** At most one pass: `ceil(bytes / 16 / 256)` blocks (5 for 20 KB), capped by the usual heuristic
+  and `VLLM_RDNA_AR_BLOCKS`.
+
+The selection is inside the extension, like `host`; the Python side is unchanged.
+
+**To do:** `tools/rdna2/ar_ops_test.py` with `VLLM_RDNA_AR_MODE=wide` (correctness, graph replay, timing vs p2p
+and RCCL), then a 4-worker heavy-load soak, three times. If it still drops
+cards, packet size is not the trigger, and the remaining difference from RCCL is the number of simultaneous flows
+(12 here against 4 in RCCL's ring); a ring-ordered variant would test that.
