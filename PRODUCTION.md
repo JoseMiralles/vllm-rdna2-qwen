@@ -90,8 +90,17 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `NCCL_P2P_LEVEL`, `NCCL_GRAPH_MIXING_SUPPORT` | `SYS`, `1` | Set by the serve script: direct card-to-card RCCL, and correct graph and eager mixing. |
 | TunableOp | lookup-only | Tuned GEMM rows for the installed rocBLAS build; never tuned while serving. |
 
-Single-stream decode is about 59.5 tokens/s at the production operating point, and about 62–64 tokens/s
-with the cards uncapped. Prefill throughput depends on prompt length and concurrency, averaging about
+Single-stream decode is about 59.5 tokens/s at the production operating point. The published container,
+with its defaults, reaches about 64 tokens/s on the same cards. The gap is a deliberate quality choice:
+
+- **The fp8 n-gram table**, about 52 GB. The container uses the int4 table, about 32 GB. Each decode step
+  waits on a lookup from the CPU worker, and fp8 rows are twice the size, so lookups take about 5 ms
+  instead of about 2 ms.
+- **The full 262k context.** The container uses 131k. Decode runs as captured CUDA graphs, so the
+  sparse-attention indexer scores against the full page-table capacity, which scales with the maximum
+  context length.
+
+Switching to the int4 table and a 131k context would recover the ~5 tokens/s. Prefill throughput depends on prompt length and concurrency, averaging about
 1,150–1,250 tokens/s under our mixed multi-request load test.
 
 ## Kernel command line
