@@ -6,7 +6,7 @@
 
 V620_POWER=140      # W, power cap for each Radeon PRO V620
 OTHER_POWER=140     # W, power cap for every other AMD GPU (e.g. a display card)
-V620_SCLK=2100      # MHz, V620 clock ceiling (keeps clocks flat below the cap; see ../../PRODUCTION.md)
+V620_SCLK=2300      # MHz, V620 clock ceiling (2100 = most conservative; see ../../PRODUCTION.md)
 V620_VOFFSET=-25    # mV, V620 core-voltage offset (negative = undervolt; the helper refuses positive values)
 
 # -------------------------------------------------------------------------------------------------------------

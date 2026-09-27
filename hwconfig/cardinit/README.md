@@ -14,7 +14,7 @@ None of these settings survive a reboot or a driver reload, so run `cardinit` af
 ```bash
 V620_POWER=140      # W, power cap for each V620
 OTHER_POWER=140     # W, power cap for every other AMD GPU (e.g. a display card)
-V620_SCLK=2100      # MHz, V620 clock ceiling
+V620_SCLK=2300      # MHz, V620 clock ceiling
 V620_VOFFSET=-25    # mV, V620 core-voltage offset (undervolt)
 ```
 
@@ -74,7 +74,7 @@ Example output:
 
 ```
 0000:0a:00.0 other (0x73df): cap 140 W, perf level auto
-0000:0d:00.0 V620 (0x73a1): cap 140 W, perf level auto, sclk max 2100 MHz, voltage offset -25 mV
+0000:0d:00.0 V620 (0x73a1): cap 140 W, perf level auto, sclk max 2300 MHz, voltage offset -25 mV
 ...
 found 4 V620(s), 1 other AMD GPU(s)
 ```
@@ -97,7 +97,7 @@ are not touched.
   `auto`: the ceiling only applies under load, and idle clocks, voltage and power stay low.
 - To undo: set `V620_SCLK` back to the card's default ceiling and `V620_VOFFSET=0`, then run `cardinit`.
   Or reboot. Avoid writing `r` to `pp_od_clk_voltage` by hand: it resets the whole OverDrive table.
-- `rocm-smi` and `amd-smi` report the firmware's **target** clock, which reads as the ceiling (e.g. 2100)
+- `rocm-smi` and `amd-smi` report the firmware's **target** clock, which reads as the ceiling (e.g. 2300)
   even at idle. The effective clock is in `hwmon/freq1_input`, and at idle it is near zero.
 - To apply automatically at boot, run the helper from a oneshot systemd unit ordered after the GPU driver
   has loaded.

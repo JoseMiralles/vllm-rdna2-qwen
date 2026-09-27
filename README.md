@@ -1,57 +1,85 @@
 This repo is AI slop.
 
-# WHAT'S IN THE BRANCH
+# vLLM for 4× Radeon PRO V620 — Qwen3.8-Flash-Next
 
-- vLLM fork for 4x Radeon Pro v620
-- Specifically targeting Qwen 3.8 Flash Next
-- Benching at **64 t/s decode** at MTP=0 and **1200 t/s prefill**
-- **How we run it**: [`PRODUCTION.md`](PRODUCTION.md) — the production configuration and the
-  performance/stability/power balance behind it (GPU power cap, clock ceiling and undervolt, vLLM
-  settings, kernel command line)
-- **Every environment variable**: [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md)
-- **Host configuration**: [`hwconfig/`](hwconfig/) — amdgpu kernel patches (V620 OverDrive, 100 W
-  power-cap floor) and the `cardinit` scripts that apply the GPU operating point at boot
+A fork of [vLLM](https://github.com/vllm-project/vllm) that serves **Qwen3.8-Flash-Next** (176 B
+parameters) on **four AMD Radeon PRO V620** cards (Navi 21 / gfx1030, 32 GB each) with a stock
+**TheRock ROCm 7.14** install. Stock vLLM can't do this: it doesn't support gfx1030, the model isn't
+merged upstream yet, and the model's 51-billion-row n-gram table doesn't fit on the cards. Everything
+that makes it work is in this repository.
 
-# GETTING STARTED WITH THIS FORK
+| | |
+|---|---|
+| **Hardware target** | 4× Radeon PRO V620 (gfx1030, 32 GB), tensor parallel across all four, in one box |
+| **Decode** | **~64 tokens/s** single stream, MTP off, cards uncapped · **~59.5 tokens/s** at our production 140 W setting |
+| **Prefill** | **~1,200 tokens/s** |
+| **Model files** | AWQ W4A16 backbone + quantised n-gram table (~105 GB of downloads, no conversion) |
 
-This is a fork of [vLLM](https://github.com/vllm-project/vllm) that serves the
-**Qwen3.8-Flash-Next** model (176 B parameters) on **four AMD Radeon PRO V620** cards
-(Navi 21 / gfx1030) at about **64 tokens per second** prior to MTP, built against a stock
-**TheRock ROCm 7.14** install. Stock vLLM cannot do this: it does not support gfx1030, the
-model is not merged upstream yet, and the model's 51-billion-row n-gram table does not fit on
-the cards. Everything that makes it work is in this repository. You do not need Docker, but a container is provided.
+**The warranty** does not exist. This repo is maintained by Claude and targets one box (4x v620 X399
+Threadripper). If it's useful to you, great. If it's not, you can have a refund of what you paid. ;-)
 
-**What you get**: the patched vLLM source (kernels written for this chip, a P2P all-reduce,
-int8 shadows of the dense projections — optionally as the only resident copy, for ~3 GiB/card more
-KV cache — fused decode kernels, the CPU offload for the n-gram table), the build and serve
-scripts, the benchmark/validation tools, and the research write-ups explaining every change.
+## Where to go
+
+| I want to… | Go to |
+|---|---|
+| Run it from source | [Quick start](#quick-start-from-source) below |
+| Run it in Docker | [Container image](#container-image) below |
+| See how we run it day to day (GPU power, clocks, settings, kernel line) | [`PRODUCTION.md`](PRODUCTION.md) |
+| Look up an environment variable | [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) |
+| Set up the host (amdgpu patches, power/clock script) | [`hwconfig/`](hwconfig/) |
+| Fix something that broke | [Troubleshooting](#troubleshooting) below |
+| Understand what was changed and why | [Understanding the work](#understanding-the-work) below |
+
+## Recent changes
+
+Newest first; details and measurements in [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) (§ numbers).
+
+- **Production operating point and host config** (2026-09-26): power cap, clock ceiling and undervolt
+  instead of a plain power cap, for stability under sustained load. See [`PRODUCTION.md`](PRODUCTION.md);
+  the kernel patches and `cardinit` scripts are in [`hwconfig/`](hwconfig/).
+  [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) documents every variable.
+- **Wide-write decode all-reduce**, `VLLM_RDNA_AR_MODE=wide` (§18): 16-byte writes forming whole
+  128-byte lines, writes only. Far fewer, larger PCIe transactions than the original kernel, at the same
+  decode speed.
+- **Staggered int8 prefill all-reduce** (§17) and RCCL graph mixing (`NCCL_GRAPH_MIXING_SUPPORT=1`):
+  one peer at a time per card, and correct graph and eager use of one RCCL communicator.
+- **Host-staged all-reduce**, `VLLM_RDNA_AR_MODE=host` (§15).
+- **Prefill** (§10, §11, §13, §14, §16):
+  - W4A8 MoE kernel (+27 %);
+  - bounded sparse-attention scoring;
+  - W8A8 dense GEMMs and int8-compressed prefill all-reduce (+7–9 % together);
+  - M-bucketed rocBLAS GEMMs.
+- **Cached-turn time to first token** (§12): follow-up turns on long conversations resume from an exact
+  saved state instead of re-prefilling tens of thousands of tokens.
+
+## Quick start (from source)
 
 **What you need** (details in [`docs/rdna2/README.md`](docs/rdna2/README.md) §1):
 
-- A Linux box (ours: Ubuntu, kernel 7.0) with **4× gfx103x cards with 32 GB each**, ≥96 GB of
-  RAM, ~250 GB of free disk, and **no other GPU generation in the machine**.
+- A Linux box with **4× gfx103x cards with 32 GB each**, ≥96 GB of RAM, ~250 GB of free disk, and **no
+  other GPU generation in the machine**. Ours runs Ubuntu with kernel 7.2.6; the patches in
+  [`hwconfig/kernel-patches/`](hwconfig/kernel-patches/) are only needed for the power tuning in step 7.
 - The kernel command line `amdgpu.pcie_gen_cap=0x00070007 amdgpu.aspm=0 amdgpu.runpm=0
-  amdgpu.gpu_recovery=1 amdgpu.noretry=1 amd_iommu=on iommu=pt` (without it, four of these
-  cards under tensor parallelism fall off the PCIe bus).
-- **TheRock ROCm 7.14** installed with the runfile so that `/opt/rocm` points at it and
+  amdgpu.gpu_recovery=1 amdgpu.noretry=1 amd_iommu=on iommu=pt`. Without it, four of these cards under
+  tensor parallelism fall off the PCIe bus. [`PRODUCTION.md`](PRODUCTION.md) lists our full line.
+- **TheRock ROCm 7.14**, installed with the runfile so that `/opt/rocm` points at it and
   `/opt/rocm/bin/rocminfo` lists your cards as `gfx1030`. No apt ROCm packages mixed in.
-- `git`, `cmake`, `ninja`, `gcc`, [`uv`](https://docs.astral.sh/uv/) (for a Python 3.12
-  environment), and the Hugging Face CLI (`pip install -U huggingface_hub` gives you `hf`).
+- `git`, `cmake`, `ninja`, `gcc`, [`uv`](https://docs.astral.sh/uv/) (for a Python 3.12 environment),
+  and the Hugging Face CLI (`pip install -U huggingface_hub` gives you `hf`).
 - About 3 hours of unattended build time and ~105 GB of downloads.
-
-**The warranty** does not exist. This repo is maintained by Claude and targets one box (4x v620 X399 Threadripper). If it's useful to you, great. If it's not, you can have a refund of what you paid. ;-)
 
 **The steps** (each one is spelled out in [`docs/rdna2/README.md`](docs/rdna2/README.md)):
 
-1. **Get the code.** Clone this repository — the default branch is the working one:
+1. **Get the code.** Clone this repository. The default branch, `rdna2/qwen38-flash-next`, is the
+   working one:
 
    ```bash
    git clone https://github.com/leapdragon/vllm-rdna2-qwen.git
-   cd vllm-rdna2-qwen        # you are on branch rdna2/qwen38-flash-next
+   cd vllm-rdna2-qwen
    ```
 
-2. **Build PyTorch, Triton and torchvision for gfx1030** (TheRock does not publish PyTorch
-   wheels for this GPU family, so they are built from source — this is the long step):
+2. **Build PyTorch, Triton and torchvision for gfx1030.** TheRock doesn't publish PyTorch wheels for
+   this GPU family, so they're built from source. This is the long step:
 
    ```bash
    uv venv --python 3.12 ~/venvs/vllm-rdna2-qwen
@@ -60,15 +88,15 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
    uv pip install ~/wheels/rdna2/torch-*.whl ~/wheels/rdna2/triton-*.whl ~/wheels/rdna2/torchvision-*.whl
    ```
 
-3. **Build this vLLM** (`docs/rdna2/README.md` §4 has the exact commands, including the two
-   small traps: install the wheels above *before* any other dependency, and copy
-   `/opt/rocm/share/amd_smi` somewhere writable before installing it):
+3. **Build this vLLM.** `docs/rdna2/README.md` §4 has the exact commands, including two small traps:
+   install the wheels above *before* any other dependency, and copy `/opt/rocm/share/amd_smi` somewhere
+   writable before installing it.
 
    ```bash
    uv pip install -e . --no-build-isolation --no-deps       # ~25 minutes
    ```
 
-4. **Download the model** — two parts, no conversion (§5):
+4. **Download the model**: two parts, no conversion (§5).
 
    ```bash
    hf download wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --local-dir models/qwen38-flash-next \
@@ -77,90 +105,120 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
       --local-dir models/qwen38-flash-next-ple                # 30 GB n-gram table, int4
    ```
 
-5. **Serve it** (§6). The script *is* the whole configuration:
+5. **Serve it** (§6). The script *is* the whole configuration; its settings are documented in
+   [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md).
 
    ```bash
    MODEL=models/qwen38-flash-next PLE_INT4=models/qwen38-flash-next-ple/ples_int4 \
      tools/rdna2/serve-qwen38-flash-next.sh
    ```
 
-   Boot takes ~15 minutes; `curl localhost:8000/health` returns 200 when it is up. It speaks
-   the OpenAI API on port 8000 (model name `qwen38-flash-next`).
+   Boot takes ~15 minutes; `curl localhost:8000/health` returns 200 when it's up. It speaks the OpenAI
+   API on port 8000 (model name `qwen38-flash-next`).
 
 6. **Check it** (§7):
 
    ```bash
    python tools/rdna2/validate.py        # must print PASS
-   python tools/rdna2/bench.py 3 256     # expect ~64 tokens/s decode (MTP=0; ~60-72 with MTP=3, acceptance-driven)
+   python tools/rdna2/bench.py 3 256     # expect ~64 tokens/s decode uncapped (MTP=0; ~60-72 with MTP=3)
    ```
+
+7. **Optional: tune power.** Four cards at factory power (250 W each) draw a lot, and in our experience
+   are less stable under sustained load than a tuned setting. [`PRODUCTION.md`](PRODUCTION.md) explains
+   our power cap, clock ceiling and undervolt. [`hwconfig/`](hwconfig/) has the kernel patches that allow
+   them and the `cardinit` script that applies them at boot.
 
 ## Container image
 
-The whole stack is also published as an image — TheRock ROCm 7.14, PyTorch 2.12 / Triton 3.7 built
-for gfx1030, this fork built as docs/rdna2/README.md §3–4 prescribe — so a host needs only the
-`amdgpu` driver (plus the kernel line from docs/rdna2/README.md §1), Docker, ≥ 96 GB RAM, four
-gfx103x cards with 32 GB, and the two weight downloads (no conversion):
+The whole stack is also published as an image: TheRock ROCm 7.14, PyTorch 2.12 / Triton 3.7 built for
+gfx1030, and this fork built as `docs/rdna2/README.md` §3–4 prescribe. A host needs only:
+- the `amdgpu` driver, plus the kernel line from `docs/rdna2/README.md` §1;
+- Docker;
+- ≥ 96 GB RAM;
+- four gfx103x cards with 32 GB;
+- the two weight downloads (no conversion).
 
-    mkdir -p models && cd models
-    hf download wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --local-dir qwen38-flash-next \
-       --exclude "model-00001-of-00005.safetensors"                          # 73 GB; shard 1 is not needed
-    hf download primitive-ai/Qwen3.8-Flash-Next-PLE-quant --include "ples_int4/*" \
-       --local-dir qwen38-flash-next-ple                                      # 30 GB int4 n-gram sidecar
-    cd ..
+```bash
+mkdir -p models && cd models
+hf download wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --local-dir qwen38-flash-next \
+   --exclude "model-00001-of-00005.safetensors"                          # 73 GB; shard 1 is not needed
+hf download primitive-ai/Qwen3.8-Flash-Next-PLE-quant --include "ples_int4/*" \
+   --local-dir qwen38-flash-next-ple                                      # 30 GB int4 n-gram sidecar
+cd ..
 
-    docker run -d --name qwen38 --network=host --device /dev/kfd --device /dev/dri \
-      --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
-      --ipc=host --ulimit memlock=-1 --security-opt seccomp=unconfined \
-      -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
-      -v "$PWD/models:/models" -v qwen38-compile-cache:/compile-cache \
-      ghcr.io/leapdragon/vllm-rdna2-qwen:latest
+docker run -d --name qwen38 --network=host --device /dev/kfd --device /dev/dri \
+  --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
+  --ipc=host --ulimit memlock=-1 --security-opt seccomp=unconfined \
+  -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  -v "$PWD/models:/models" -v qwen38-compile-cache:/compile-cache \
+  ghcr.io/leapdragon/vllm-rdna2-qwen:latest
 
-    docker logs -f qwen38        # first boot 15–20 min (compile + sidecar prefault); later boots ~5 min
-    curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-      -d '{"model":"qwen38-flash-next","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":64}'
+docker logs -f qwen38        # first boot 15–20 min (compile + sidecar prefault); later boots ~5 min
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen38-flash-next","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":64}'
+```
 
-Every knob of `tools/rdna2/serve-qwen38-flash-next.sh` works as `-e` (`MTP=0` for no speculative
-decoding, `MAXLEN`, `VISION=1`, `CHAT_KWARGS`, `PORT`, `DRYRUN=1`, …). Full walkthrough — flags
-explained, stop/update, getting a support report, how the image is built and why its ROCm comes from
-TheRock's legacy tarball index: [containers/README.md](containers/README.md).
+Every knob of `tools/rdna2/serve-qwen38-flash-next.sh` works as `-e`: `MTP=0` for no speculative
+decoding, `MAXLEN`, `VISION=1`, `CHAT_KWARGS`, `PORT`, `DRYRUN=1`, and so on (all listed in
+[`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md)). GPU power tuning happens on the host, not in the
+container: see [`hwconfig/`](hwconfig/). The full walkthrough is in [containers/README.md](containers/README.md):
+flags explained, stop/update, getting a support report, how the image is built, and why its ROCm comes from
+TheRock's legacy tarball index.
 
 ## Troubleshooting
 
-1. **Read [`docs/rdna2/TROUBLESHOOTING.md`](docs/rdna2/TROUBLESHOOTING.md) first.** This
-   platform's failure modes point away from their causes (a PLE timeout is usually storage,
-   RAM or a missing env var; a "hang with MTP" is usually the drafter; a wrong GPU identity is
-   a kernel-line issue). For anything involving the n-gram table, PLE timeouts or slow
-   lookups, the step-by-step is [`docs/rdna2/PLE-DIAGNOSTIC-TREE.md`](docs/rdna2/PLE-DIAGNOSTIC-TREE.md).
-2. **Run the report script and send it to me.**
+1. **Read [`docs/rdna2/TROUBLESHOOTING.md`](docs/rdna2/TROUBLESHOOTING.md) first.** This platform's
+   failure modes point away from their causes:
+   - a PLE timeout is usually storage, RAM or a missing env var;
+   - a "hang with MTP" is usually the drafter;
+   - a wrong GPU identity is a kernel-line issue.
+
+   For anything involving the n-gram table, PLE timeouts or slow lookups, follow
+   [`docs/rdna2/PLE-DIAGNOSTIC-TREE.md`](docs/rdna2/PLE-DIAGNOSTIC-TREE.md).
+2. **Cards dropping off the bus under heavy load?** See the GPU operating point in
+   [`PRODUCTION.md`](PRODUCTION.md), and TROUBLESHOOTING §5d for the all-reduce modes
+   (`VLLM_RDNA_AR_MODE=wide`, or `VLLM_RDNA_AR=0` as the fallback).
+3. **Run the report script and send it to me.**
 
    ```bash
    tools/rdna2/system-report.sh --probe      # add --tests if no server is running
    ```
 
-   It writes `system-report.log` (host, PCIe links, GPUs, ROCm, venv, torch/vLLM build,
-   model files and their storage, the resolved serve command, running processes, a digest of
-   your newest serve log, the kernel log of this and the previous boot; `--probe` adds a live
-   health/metrics/tiny-completion check). It modifies nothing and redacts home paths, user,
-   hostname, IPs and anything that looks like a secret — skim it, then **DM it to me on
-   Discord (`<DISCORD-HANDLE>`)** together with the exact error text and one paragraph on
-   what you were doing. That file answers most questions before I have to ask them.
-3. [`docs/rdna2/README.md`](docs/rdna2/README.md) §9 has the remaining known issues.
+   It writes `system-report.log`, covering host, PCIe links, GPUs, ROCm, venv, the torch/vLLM build,
+   model files and their storage, the resolved serve command, running processes, a digest of your newest
+   serve log, and the kernel log of this and the previous boot. `--probe` adds a live health, metrics and
+   tiny-completion check. The script modifies nothing, and it redacts home paths, user, hostname, IPs and
+   anything that looks like a secret. Skim it, then **DM it to me on Discord (`<DISCORD-HANDLE>`)** with the
+   exact error text and one paragraph on what you were doing. That file answers most questions before I
+   have to ask them.
+4. [`docs/rdna2/README.md`](docs/rdna2/README.md) §9 has the remaining known issues.
 
-## Housekeeping
+## Understanding the work
 
-**To see what was changed**: the GitHub compare view
+**What was changed:** the GitHub compare view
 [`2a46f85b43...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...rdna2/qwen38-flash-next)
-shows only this fork's commits and diff (everything after the merge of the Flash-Next model
-branch); [`main...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/main...rdna2/qwen38-flash-next)
-shows everything vs upstream vLLM. `docs/rdna2/CHANGES.md` opens with a map of where the code lives.
+shows only this fork's commits and diff, i.e. everything after the merge of the Flash-Next model branch.
+[`main...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/main...rdna2/qwen38-flash-next)
+shows everything against upstream vLLM. `main` tracks upstream vLLM; this fork's work is on
+`rdna2/qwen38-flash-next`.
 
-**To understand or reuse the work**: [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) — every
-change and the reason for it; [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md) — the measured
-numbers; [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md) — the silicon profile the
-kernels were designed against; [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) — every
-environment variable; [`PRODUCTION.md`](PRODUCTION.md) — the production configuration;
-[`hwconfig/`](hwconfig/) — kernel patches and GPU power/clock setup; [`tools/rdna2/`](tools/rdna2/) —
-build, serve, benchmark, profile and test tools. `main` tracks upstream vLLM; this fork's work is on `rdna2/qwen38-flash-next`.
+**What's included:**
+- the patched vLLM source: kernels written for this chip, a custom all-reduce, int8 copies of the dense
+  projections (optionally as the only resident copy, for ~3 GiB/card more KV cache), fused decode kernels,
+  and the CPU offload for the n-gram table;
+- the build and serve scripts and the benchmark and validation tools;
+- write-ups explaining every change.
+
+| Document | What it covers |
+|---|---|
+| [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) | Every change and the reason for it; opens with a map of where the code lives |
+| [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md) | The measured numbers |
+| [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md) | The silicon profile the kernels were designed against |
+| [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) | Every environment variable |
+| [`PRODUCTION.md`](PRODUCTION.md) | The production configuration and the performance/stability/power balance behind it |
+| [`hwconfig/`](hwconfig/) | amdgpu kernel patches and the GPU power/clock setup script |
+| [`docs/rdna2/README.md`](docs/rdna2/README.md) | The detailed install guide behind the quick start |
+| [`tools/rdna2/`](tools/rdna2/) | Build, serve, benchmark, profile and test tools |
 
 ---
 

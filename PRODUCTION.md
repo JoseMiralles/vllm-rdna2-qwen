@@ -16,9 +16,9 @@ rather than something to assume. What mattered most:
 
 - **Steady card power, not just less of it.** A power cap alone makes each card's firmware constantly
   adjust clock and voltage to hold the average, and all four cards do it at the same moments. A clock
-  ceiling set below what the cap would allow, plus a small undervolt, keeps clocks flat under load at a
-  more efficient point on the voltage–frequency curve. That configuration held up where plain caps at
-  similar or higher power did not. It is also faster than a plain cap at the same electricity cost.
+  ceiling plus a small undervolt keeps clocks flat, at a more efficient point on the voltage–frequency
+  curve, wherever the ceiling rather than the cap is the limit. That held up where plain caps at similar
+  or higher power did not, and it is faster than a plain cap at the same electricity cost.
 - **The shape of inter-GPU traffic.** Moving data as fewer, larger transactions (`VLLM_RDNA_AR_MODE=wide`,
   `NCCL_PROTO=Simple`), and staggering exchanges so each card talks to one peer at a time, reduced stress
   on the PCIe fabric. It helped, but did not fix the problem on its own.
@@ -38,12 +38,25 @@ driver in [`hwconfig/kernel-patches/`](hwconfig/kernel-patches/).
 | Setting | Value | Notes |
 |---|---|---|
 | Power cap | **140 W** per card | Down from the 250 W default; needs the 100 W-floor patch. |
-| Clock ceiling | **2100 MHz** (V620) | Below the card's sustained clock at the cap, so clocks stay flat instead of the cap constantly adjusting them. |
+| Clock ceiling | **2300 MHz** (V620) | Decode draws less power than prefill, so decode runs flat at the ceiling, below the cap. Heavy prefill reaches the cap and runs a little below the ceiling. |
 | Core voltage offset | **−25 mV** (V620) | Undervolt; lowers power at a given clock. Validate model quality after any change. |
 | Performance level | `auto` | Idle clocks, voltage and power stay low (~10 W per card). The ceiling only applies under load. |
 
-Under sustained load this runs at roughly 130 W per card with flat clocks. Prefill is about 11 % faster
-than a plain 120 W cap, for about the same electricity.
+**Choosing the ceiling.** Decode on this platform is latency-bound: each token runs many small kernels
+and about 95 all-reduces, so it scales with GPU clock. Single-stream decode at a 140 W cap:
+
+| Ceiling | Decode |
+|---|---|
+| 2100 MHz | 53–54 tokens/s |
+| 2250 MHz | ~58 tokens/s |
+| **2300 MHz** | **~59.5 tokens/s** |
+
+At 2100 MHz the ceiling is below what the cards sustain at the cap even in prefill, so clocks stay flat
+everywhere; that is the most conservative setting, and it passed three consecutive load tests. At 2300 MHz
+decode runs at the full ceiling, while heavy prefill runs at the cap. There each card settles at about
+2050–2160 MHz, depending on its own silicon, and the cap adjusts clocks again. 2300 MHz also passed three
+consecutive load tests, so we run it for the decode speed. **If stability suffers, step the ceiling back
+down (2250, then 2100) before touching anything else.**
 
 **Host.**
 
@@ -77,8 +90,9 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `NCCL_P2P_LEVEL`, `NCCL_GRAPH_MIXING_SUPPORT` | `SYS`, `1` | Set by the serve script: direct card-to-card RCCL, and correct graph and eager mixing. |
 | TunableOp | lookup-only | Tuned GEMM rows for the installed rocBLAS build; never tuned while serving. |
 
-Single-stream decode is about 62 tokens/s. Prefill throughput depends on prompt length and concurrency,
-averaging about 1,150–1,250 tokens/s under our mixed multi-request load test.
+Single-stream decode is about 59.5 tokens/s at the production operating point, and about 62–64 tokens/s
+with the cards uncapped. Prefill throughput depends on prompt length and concurrency, averaging about
+1,150–1,250 tokens/s under our mixed multi-request load test.
 
 ## Kernel command line
 
@@ -107,7 +121,7 @@ it forces every device onto legacy shared interrupts.
 
 Before adopting a change we run a 4-minute load test. It uses four concurrent workers mixing fresh long
 prompts (2k–40k tokens), follow-up turns and decodes, while monitoring kernel events and each card's
-power, clocks, voltage and temperature. The current operating point passed three consecutive runs with no
-errors and no kernel events. We treat that as strong evidence, not a guarantee: confidence grows with
+power, clocks, voltage and temperature. Both the 2100 MHz and the 2300 MHz operating points passed three
+consecutive runs with no errors and no kernel events. We treat that as strong evidence, not a guarantee: confidence grows with
 accumulated clean runtime at a fixed configuration, and we re-test after kernel, driver, firmware, BIOS or
 model changes.
