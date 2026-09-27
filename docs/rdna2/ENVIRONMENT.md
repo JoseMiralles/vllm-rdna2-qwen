@@ -64,7 +64,7 @@ path, and everything else to RCCL.
 | Variable | Default | Meaning |
 |---|---|---|
 | `VLLM_RDNA_AR` | `1` | Use the fork's one-shot all-reduce for messages up to `VLLM_RDNA_AR_MAX_KB`. `0` sends everything to RCCL: always works, about 26 % slower single-stream decode. |
-| `VLLM_RDNA_AR_MODE` | `p2p` | How the one-shot kernel moves data. See below. **Recommended: `wide`.** |
+| `VLLM_RDNA_AR_MODE` | `p2p` (serve script: `wide`) | How the one-shot kernel moves data. See below. The serve script defaults to `wide` (since 2026-09-27). |
 | `VLLM_RDNA_AR_MAX_KB` | `64` | Largest message (KB) taken by the one-shot kernel. Decode messages (batch × 2560 fp16) fit; larger ones go to RCCL, which is faster there. |
 | `VLLM_RDNA_AR_BLOCKS` | `0` (auto) | Cap on thread blocks per launch. Fewer blocks mean fewer concurrent PCIe write streams, at some latency cost (20 KB: 16/4/1 blocks = 33/36/76 µs). |
 | `VLLM_RDNA_AR_PACE` | `0` | Idle time inserted between strided stores, in units of ~64 GPU clocks (0–127). Spaces out bursts on the bus. `0` = off. |
@@ -201,7 +201,7 @@ Not added by this fork, but part of the working configuration.
 | `HSA_NO_SCRATCH_RECLAIM` | `1` | Keeps the ROCm runtime from reclaiming kernel scratch memory mid-run. Part of the multi-card stability setup. |
 | `NCCL_P2P_LEVEL` | `SYS` (from `P2P`) | RCCL may use direct card-to-card transfers between all cards. |
 | `NCCL_GRAPH_MIXING_SUPPORT` | `1` | Declares that one RCCL communicator is used both in CUDA graphs and eagerly (graph usage mode 2). Without it, RCCL warns on every captured collective that the mix "can lead to hangs". No measurable cost. |
-| `NCCL_PROTO` | not set by the script; `Simple` in production | Forces RCCL onto its large-chunk protocol instead of "LL", which moves data as 8-byte stores each carrying a flag. Fewer, larger bus transactions for mid-sized messages. |
+| `NCCL_PROTO` | `Simple` (since 2026-09-27; set it empty to let RCCL choose) | Forces RCCL onto its large-chunk protocol instead of "LL", which moves data as 8-byte stores each carrying a flag. Fewer, larger bus transactions for mid-sized messages. |
 | `VLLM_ROCM_USE_AITER` | `0` | AITER is CDNA-only; it has nothing for gfx1030. |
 | `TORCH_BLAS_PREFER_HIPBLASLT` | `0` | Use rocBLAS: hipBLASLt has no tuned kernels for gfx1030. |
 | `FLASH_ATTENTION_TRITON_AMD_ENABLE` | `TRUE` | Use the Triton flash-attention backend on AMD. |

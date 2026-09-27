@@ -61,7 +61,16 @@ docker run -d --name qwen38 --network=host \
   before it ignore the knob), `VISION` (0/1), `CHAT_KWARGS`
   (`'{"preserve_thinking": true, "reasoning_effort": "medium"}'`), `TOOLS` (1), `PORT` (8000 —
   add `-e HEALTHCHECK_PORT=`), `EXTRA_ARGS`, `DRYRUN=1` (print the resolved command and exit).
-  Semantics and the measured worth of each: README §6 and [CHANGES.md](../docs/rdna2/CHANGES.md).
+  Semantics and the measured worth of each: README §6 and [CHANGES.md](../docs/rdna2/CHANGES.md);
+  every variable is listed in [ENVIRONMENT.md](../docs/rdna2/ENVIRONMENT.md).
+- **Stability defaults** (images from 2026-09-27 on): the decode all-reduce uses the `wide` transport
+  (`VLLM_RDNA_AR_MODE=wide`) and RCCL uses its `Simple` protocol (`NCCL_PROTO=Simple`). Both cut the number of
+  small PCIe transactions, which is what knocked cards off the bus under sustained load on some boards. The prefill
+  speed features stay opt-in: `-e VLLM_RDNA_MOE_W4A8=1 -e VLLM_RDNA_DENSE_W8A8=1 -e VLLM_RDNA_AR_Q8=1`.
+- **GPU power, clocks and undervolt are host settings**, not container ones: the container can't change them.
+  Our production operating point (power cap, clock ceiling, undervolt) and the reasoning are in
+  [PRODUCTION.md](../PRODUCTION.md); the kernel patches and the `cardinit` script that apply them are in
+  [hwconfig/](../hwconfig/).
 
 **3. Query** — a standard OpenAI-compatible server (`--served-model-name qwen38-flash-next`):
 

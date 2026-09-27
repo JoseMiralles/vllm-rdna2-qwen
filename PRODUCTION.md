@@ -81,12 +81,12 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `PLE_INT4` | fp8 n-gram table sidecar | The n-gram table served from host memory by the CPU offload worker. |
 | `EXTRA_ARGS` | `--prefix-cache-retention-interval 6272` | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns. |
 | `VLLM_RDNA_AR` | `1` | Custom one-shot all-reduce for decode-sized messages. |
-| `VLLM_RDNA_AR_MODE` | `wide` | 16-byte writes forming whole 128-byte lines, writes only, local waiting. |
+| `VLLM_RDNA_AR_MODE` | `wide` | 16-byte writes forming whole 128-byte lines, writes only, local waiting. The serve script's default. |
 | `VLLM_RDNA_AR_BLOCKS`, `VLLM_RDNA_AR_PACE` | `4`, `16` | Fewer concurrent write streams, with spacing between bursts. |
 | `VLLM_RDNA_AR_Q8` | `1` | int8-compressed prefill all-reduce, staggered exchange (the default). |
 | `VLLM_RDNA_MOE_W4A8` | `1` | int8-activation × int4-expert MoE kernel for prefill. |
 | `VLLM_RDNA_DENSE_W8A8` | `1` | int8 × int8 prefill GEMMs for the dense projections. |
-| `NCCL_PROTO` | `Simple` | RCCL moves data in large chunks rather than flagged 8-byte stores. |
+| `NCCL_PROTO` | `Simple` | RCCL moves data in large chunks rather than flagged 8-byte stores. The serve script's default. |
 | `NCCL_P2P_LEVEL`, `NCCL_GRAPH_MIXING_SUPPORT` | `SYS`, `1` | Set by the serve script: direct card-to-card RCCL, and correct graph and eager mixing. |
 | TunableOp | lookup-only | Tuned GEMM rows for the installed rocBLAS build; never tuned while serving. |
 
