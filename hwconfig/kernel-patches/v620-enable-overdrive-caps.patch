@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+@@ -427,6 +427,18 @@
+ 	 */
+ 	smu->od_settings = &powerplay_table->overdrive_table;
+ 
++	/*
++	 * Radeon Pro V620 (1002:73a1): OverDrive table is populated but all
++	 * capability flags ship zeroed, so OD editing is never exposed. Flip
++	 * the four caps the table supports. Gated on device id.
++	 */
++	if (smu->adev->pdev->device == 0x73a1) {
++		powerplay_table->overdrive_table.cap[SMU_11_0_7_ODCAP_GFXCLK_LIMITS] = 1;
++		powerplay_table->overdrive_table.cap[SMU_11_0_7_ODCAP_GFXCLK_CURVE]  = 1;
++		powerplay_table->overdrive_table.cap[SMU_11_0_7_ODCAP_UCLK_LIMITS]   = 1;
++		powerplay_table->overdrive_table.cap[SMU_11_0_7_ODCAP_POWER_LIMIT]   = 1;
++	}
++
+ 	return 0;
+ }
+ 

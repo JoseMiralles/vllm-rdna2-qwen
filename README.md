@@ -5,6 +5,12 @@ This repo is AI slop.
 - vLLM fork for 4x Radeon Pro v620
 - Specifically targeting Qwen 3.8 Flash Next
 - Benching at **64 t/s decode** at MTP=0 and **1200 t/s prefill**
+- **How we run it**: [`PRODUCTION.md`](PRODUCTION.md) — the production configuration and the
+  performance/stability/power balance behind it (GPU power cap, clock ceiling and undervolt, vLLM
+  settings, kernel command line)
+- **Every environment variable**: [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md)
+- **Host configuration**: [`hwconfig/`](hwconfig/) — amdgpu kernel patches (V620 OverDrive, 100 W
+  power-cap floor) and the `cardinit` scripts that apply the GPU operating point at boot
 
 # GETTING STARTED WITH THIS FORK
 
@@ -151,8 +157,10 @@ shows everything vs upstream vLLM. `docs/rdna2/CHANGES.md` opens with a map of w
 **To understand or reuse the work**: [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) — every
 change and the reason for it; [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md) — the measured
 numbers; [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md) — the silicon profile the
-kernels were designed against; [`tools/rdna2/`](tools/rdna2/) — build, serve, benchmark, profile
-and test tools. `main` tracks upstream vLLM; this fork's work is on `rdna2/qwen38-flash-next`.
+kernels were designed against; [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) — every
+environment variable; [`PRODUCTION.md`](PRODUCTION.md) — the production configuration;
+[`hwconfig/`](hwconfig/) — kernel patches and GPU power/clock setup; [`tools/rdna2/`](tools/rdna2/) —
+build, serve, benchmark, profile and test tools. `main` tracks upstream vLLM; this fork's work is on `rdna2/qwen38-flash-next`.
 
 ---
 

@@ -1,0 +1,24 @@
+#!/bin/bash
+# cardinit -- GPU power caps and V620 clock/voltage settings. Run after every boot (nothing persists).
+# EDIT THE VALUES HERE -- no sudo needed. Leave a value empty ("") to leave that setting untouched.
+# The root-owned helper /usr/local/sbin/cardinit-apply only validates and applies them; it finds the cards by
+# PCI ID on every run, so slot or address changes need no edits anywhere.
+
+V620_POWER=140      # W, power cap for each Radeon PRO V620
+OTHER_POWER=140     # W, power cap for every other AMD GPU (e.g. a display card)
+V620_SCLK=2100      # MHz, V620 clock ceiling (keeps clocks flat below the cap; see ../../PRODUCTION.md)
+V620_VOFFSET=-25    # mV, V620 core-voltage offset (negative = undervolt; the helper refuses positive values)
+
+# -------------------------------------------------------------------------------------------------------------
+HELPER=/usr/local/sbin/cardinit-apply
+if [ ! -x "$HELPER" ]; then
+  echo "cardinit: $HELPER is not installed. Run:" >&2
+  echo "  sudo install -o root -g root -m 0755 <path to>/cardinit-apply $HELPER" >&2
+  exit 1
+fi
+args=()
+[ -n "$V620_POWER" ]   && args+=(--v620-power "$V620_POWER")
+[ -n "$OTHER_POWER" ]  && args+=(--other-power "$OTHER_POWER")
+[ -n "$V620_SCLK" ]    && args+=(--v620-sclk "$V620_SCLK")
+[ -n "$V620_VOFFSET" ] && args+=(--v620-voffset "$V620_VOFFSET")
+exec sudo "$HELPER" "${args[@]}"

@@ -1,0 +1,87 @@
+#!/bin/bash
+# cardinit-apply -- apply GPU power caps and V620 clock/voltage settings. Run as root; values come in as options.
+# The settings themselves live in the `cardinit` script (edit them there, no sudo needed); this tool only validates and
+# applies them, so it rarely changes. Install it root-owned after any edit of THIS file:
+#   sudo install -o root -g root -m 0755 cardinit-apply /usr/local/sbin/cardinit-apply
+#
+# Usage: cardinit-apply [--v620-power W] [--other-power W] [--v620-sclk MHz] [--v620-voffset mV]
+#   --v620-power W     power cap for every Radeon PRO V620 (PCI ID 1002:73a1)
+#   --other-power W    power cap for every other AMD GPU (e.g. the RX 6700 XT display card)
+#   --v620-sclk MHz    V620 OverDrive clock ceiling (OD_SCLK level 1), within the card's OD_RANGE
+#   --v620-voffset mV  V620 core-voltage offset; only 0 or negative (undervolt), down to -150
+# Any option left out is not touched. GPUs are found by vendor/device ID on every run, never by PCI address or
+# card index, so cards may move slots or renumber freely. Nothing persists across a reboot -- run after every boot.
+set -u
+
+V620_ID=0x73a1
+V620_POWER=""; OTHER_POWER=""; V620_SCLK=""; V620_VOFF=""
+
+die() { echo "cardinit-apply: $*" >&2; exit 2; }
+isint() { [[ "$1" =~ ^-?[0-9]+$ ]]; }
+while [ $# -gt 0 ]; do
+  [ $# -ge 2 ] || die "option $1 needs a value"
+  case "$1" in
+    --v620-power)   V620_POWER=$2 ;;
+    --other-power)  OTHER_POWER=$2 ;;
+    --v620-sclk)    V620_SCLK=$2 ;;
+    --v620-voffset) V620_VOFF=$2 ;;
+    *) die "unknown option $1" ;;
+  esac
+  isint "$2" || die "$1 needs an integer, got '$2'"
+  shift 2
+done
+# hard safety bounds (the driver enforces the per-card power and clock limits on top of these)
+inrange() { [ -z "$1" ] || { [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; }; }   # empty = not requested = fine
+inrange "$V620_POWER"  50 300    || die "--v620-power must be 50..300 W"
+inrange "$OTHER_POWER" 50 300    || die "--other-power must be 50..300 W"
+inrange "$V620_SCLK"   500 2650  || die "--v620-sclk must be 500..2650 MHz"
+inrange "$V620_VOFF"   -150 0    || die "--v620-voffset must be -150..0 mV (undervolt only)"
+[ "$(id -u)" -eq 0 ] || die "must run as root (run it through the cardinit script)"
+
+rc=0; nv620=0; nother=0
+od() { echo "$2" > "$1/pp_od_clk_voltage" 2>/dev/null; }
+
+for dev in /sys/bus/pci/devices/*; do
+  [ "$(cat "$dev/vendor" 2>/dev/null)" = "0x1002" ] || continue
+  case "$(cat "$dev/class" 2>/dev/null)" in 0x0300*|0x0380*) ;; *) continue ;; esac   # display-class functions only
+  bdf=$(basename "$dev"); id=$(cat "$dev/device")
+  hw=$(ls -d "$dev"/hwmon/hwmon* 2>/dev/null | head -1)
+  if [ -z "$hw" ]; then echo "$bdf ($id): no hwmon -- driver not bound or card lost; skipped"; rc=1; continue; fi
+  if [ "$id" = "$V620_ID" ]; then kind=V620; cap=$V620_POWER; nv620=$((nv620 + 1)); else kind=other; cap=$OTHER_POWER; nother=$((nother + 1)); fi
+
+  # --- power cap (sysfs takes microwatts) -----------------------------------------------------------
+  if [ -n "$cap" ] && ! echo $((cap * 1000000)) > "$hw/power1_cap" 2>/dev/null; then
+    echo "$bdf: power cap $cap W rejected (card allows $(( $(cat "$hw/power1_cap_min")/1000000 ))-$(( $(cat "$hw/power1_cap_max")/1000000 )) W)"; rc=1
+  fi
+
+  # --- V620: clock ceiling and voltage offset via the OverDrive table ---------------------------------
+  if [ "$kind" = V620 ] && { [ -n "$V620_SCLK" ] || [ -n "$V620_VOFF" ]; }; then
+    apply() {
+      { [ -z "$V620_SCLK" ] || od "$dev" "s 1 $V620_SCLK"; } &&
+      { [ -z "$V620_VOFF" ] || od "$dev" "vo $V620_VOFF"; } && od "$dev" "c"
+    }
+    if ! apply; then   # some driver states accept OverDrive edits only in manual mode: switch, apply, restore
+      lvlf="$dev/power_dpm_force_performance_level"; lvl=$(cat "$lvlf")
+      echo manual > "$lvlf" 2>/dev/null
+      apply || { echo "$bdf: OverDrive write rejected"; rc=1; }
+      echo "$lvl" > "$lvlf" 2>/dev/null
+    fi
+  fi
+
+  # --- report what the card now reports, and check it against the request -----------------------------
+  now=$(( $(cat "$hw/power1_cap")/1000000 ))
+  line="$bdf $kind ($id): cap ${now} W, perf level $(cat "$dev/power_dpm_force_performance_level")"
+  [ -z "$cap" ] || [ "$now" = "$cap" ] || { line="$line [cap NOT $cap W]"; rc=1; }
+  if [ "$kind" = V620 ]; then
+    smax=$(grep -A2 '^OD_SCLK' "$dev/pp_od_clk_voltage" | tail -1 | awk '{print $2}' | tr -dc '0-9')
+    voff=$(grep -A1 '^OD_VDDGFX_OFFSET' "$dev/pp_od_clk_voltage" | tail -1 | tr -dc '0-9-')
+    line="$line, sclk max ${smax} MHz, voltage offset ${voff} mV"
+    [ -z "$V620_SCLK" ] || [ "$smax" = "$V620_SCLK" ] || { line="$line [sclk NOT $V620_SCLK]"; rc=1; }
+    [ -z "$V620_VOFF" ] || [ "$voff" = "$V620_VOFF" ] || { line="$line [offset NOT $V620_VOFF]"; rc=1; }
+  fi
+  echo "$line"
+done
+
+echo "found $nv620 V620(s), $nother other AMD GPU(s)"
+[ "$nv620" -gt 0 ] || { echo "WARNING: no V620 found"; rc=1; }
+exit $rc

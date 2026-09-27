@@ -1,0 +1,61 @@
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+@@ -636,6 +636,49 @@
+ 	return od_table->cap[cap];
+ }
+ 
++/*
++ * Powercap floor override.
++ *
++ * Some boards declare an OverDrive "power percentage" lower bound that keeps
++ * the minimum PPT limit far above what the board can actually run at, so
++ * userspace cannot cap them down.  Entries here lower that floor; driver_data
++ * carries the desired floor in whole watts.
++ *
++ * Matching is on PCI IDs only, so it is machine-independent.  Use
++ * PCI_ANY_ID for the subsystem IDs to match every AIB partner board built
++ * around a given ASIC.
++ */
++static const struct pci_device_id sienna_cichlid_min_powercap_overrides[] = {
++	/* Radeon PRO V620 reference board (default 250 W) */
++	{ PCI_DEVICE_SUB(0x1002, 0x73a1, 0x1002, 0x0e34),
++	  .driver_data = 100 },
++	/* Navi 22: RX 6700 / 6700 XT / 6750 XT, any board (default 186 W) */
++	{ PCI_DEVICE_SUB(0x1002, 0x73df, PCI_ANY_ID, PCI_ANY_ID),
++	  .driver_data = 100 },
++	{ }
++};
++
++static noinline void sienna_cichlid_min_powercap_fix(struct smu_context *smu,
++						     uint32_t *min_power_limit)
++{
++	const struct pci_device_id *id;
++	uint32_t floor;
++
++	id = pci_match_id(sienna_cichlid_min_powercap_overrides,
++			  smu->adev->pdev);
++	if (!id)
++		return;
++
++	/* *min_power_limit is in WATTS here; hwmon scales to uW for sysfs. */
++	floor = (uint32_t)id->driver_data;
++	if (*min_power_limit > floor) {
++		*min_power_limit = floor;
++		dev_notice(smu->adev->dev,
++			   "powerfix: allowing PPT limit down to %u W on %s\n",
++			   floor, dev_name(smu->adev->dev));
++	}
++}
++
+ static int sienna_cichlid_get_power_limit(struct smu_context *smu,
+ 					  uint32_t *current_power_limit,
+ 					  uint32_t *default_power_limit,
+@@ -682,6 +725,8 @@
+ 	if (min_power_limit) {
+ 		*min_power_limit = power_limit * (100 - od_percent_lower);
+ 		*min_power_limit /= 100;
++
++		sienna_cichlid_min_powercap_fix(smu, min_power_limit);
+ 	}
+ 	return 0;
+ }
