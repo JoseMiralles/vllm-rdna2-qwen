@@ -9,7 +9,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -18,13 +20,13 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-import vllm.envs as envs
 from vllm.model_executor.layers.ple_offload_layer import (
     PleOffloadLayer,
     is_offload_process,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.qwen4_exp import (
@@ -38,7 +40,221 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import compute_ple_shard_overlap, copy_ple_embedding_shard_
+
+
+def _stub_gpu_quant_table(embedding: VocabParallelEmbedding) -> None:
+    """Replace the bf16 n-gram table parameter with a 0-element placeholder.
+
+    The packed sidecar table replaces it; keeping the full table would allocate
+    width * rows * 2 bytes per rank for nothing. Mirrors the meta-safe parameter
+    swap in ``_ple_quant_attach`` (vllm/v1/ple_offload/worker.py).
+    """
+    target = embedding.weight
+    stub = torch.empty(0, embedding.embedding_dim, dtype=target.dtype)
+    if target.is_meta:
+        new_param = torch.nn.Parameter(stub, requires_grad=False)
+        for attr, value in vars(target).items():
+            setattr(new_param, attr, value)
+        embedding.weight = new_param
+    else:
+        target.data = stub
+
+
+def _e4m3_lut() -> torch.Tensor:
+    """Decode table for the 256 e4m3 byte values (NaN entries map to 0)."""
+    values = []
+    for byte in range(256):
+        sign = -1.0 if byte & 0x80 else 1.0
+        exponent = (byte >> 3) & 0xF
+        mantissa = byte & 0x7
+        if exponent == 0:
+            magnitude = mantissa / 8.0 * 2.0**-6
+        elif exponent == 15:
+            # e4m3fn has no infinity: exp=15, mantissa=7 is NaN, the rest are large normals.
+            magnitude = (
+                float("nan") if mantissa == 7 else (1.0 + mantissa / 8.0) * 2.0**8
+            )
+        else:
+            magnitude = (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
+        values.append(sign * magnitude)
+    return torch.tensor(values, dtype=torch.float32)
+
+
+def _load_gpu_quant_table(
+    quant_dir: str,
+    rows: int,
+    width: int,
+    tp_start: int,
+    tp_end: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    """Load this TP rank's row range of a quantised sidecar to GPU memory.
+
+    Returns the packed rows, the scales, and the sidecar layout. int4 group-16
+    rows are uint8 nibbles ``(rows_local, width // 2)`` with fp16 group scales
+    ``(rows_local, width // group)``; fp8 per-row rows are e4m3 bytes
+    ``(rows_local, width)`` with one fp32 scale per row. Shards are read one
+    at a time.
+    """
+    import json
+    import os
+    import re
+
+    from safetensors import safe_open
+
+    with open(os.path.join(quant_dir, "META.json")) as meta_file:
+        meta = json.load(meta_file)
+    layout = str(meta["layout"])
+    is_fp8 = "e4m3" in layout and "e2m1" not in layout
+    if not is_fp8 and ("int4" not in layout or "lownibblefirst" not in layout):
+        raise ValueError(
+            f"VLLM_PLE_GPU_QUANT expects an int4 low-nibble-first or fp8 "
+            f"per-row sidecar layout, got {layout!r}"
+        )
+    group = 0
+    if not is_fp8:
+        group_match = re.search(r"group(\d+)", layout)
+        if group_match is None:
+            raise ValueError(f"sidecar layout has no group size: {layout!r}")
+        group = int(group_match.group(1))
+    if meta["rows"] != rows or meta["width"] != width:
+        raise ValueError(
+            f"sidecar is {meta['rows']}x{meta['width']}, table is {rows}x{width}"
+        )
+    n_shards = int(meta["shards"])
+    rows_per_shard = rows // n_shards
+    if rows_per_shard * n_shards != rows:
+        raise ValueError("non-uniform sidecar shards")
+    if not is_fp8 and (group <= 0 or width % group):
+        raise ValueError(f"width {width} is not divisible by group {group}")
+    rows_local = tp_end - tp_start
+    if is_fp8:
+        packed_local = torch.empty(rows_local, width, dtype=torch.uint8, device=device)
+        scales_local = torch.empty(rows_local, dtype=torch.float32, device=device)
+    else:
+        packed_local = torch.empty(
+            rows_local, width // 2, dtype=torch.uint8, device=device
+        )
+        scales_local = torch.empty(
+            rows_local, width // group, dtype=torch.float16, device=device
+        )
+    covered = 0
+    for shard in range(n_shards):
+        overlap = compute_ple_shard_overlap(
+            checkpoint_start=shard * rows_per_shard,
+            checkpoint_rows=rows_per_shard,
+            tp_start=tp_start,
+            tp_end=tp_end,
+        )
+        if overlap is None:
+            continue
+        with safe_open(
+            os.path.join(quant_dir, f"shard_{shard}.safetensors"), framework="pt"
+        ) as f:
+            key = "weight_fp8" if is_fp8 else "weight_i4"
+            packed = f.get_tensor(key).narrow(
+                0, overlap.source_start, overlap.row_count
+            )
+            scales = f.get_tensor("weight_scale").narrow(
+                0, overlap.source_start, overlap.row_count
+            )
+        if is_fp8:
+            if packed.dtype != torch.uint8:
+                packed = packed.view(torch.uint8)
+            if scales.dtype != torch.float32 or scales.shape != (overlap.row_count,):
+                raise ValueError(
+                    f"sidecar shard {shard} has unexpected fp8 scales "
+                    f"{tuple(scales.shape)} of {scales.dtype}"
+                )
+        elif scales.dtype != torch.float16 or scales.shape[1] * group != width:
+            raise ValueError(
+                f"sidecar shard {shard} has unexpected scales "
+                f"{tuple(scales.shape)} of {scales.dtype}"
+            )
+        dest = overlap.destination_start
+        packed_local[dest : dest + overlap.row_count].copy_(packed)
+        scales_local[dest : dest + overlap.row_count].copy_(scales)
+        covered += overlap.row_count
+    if covered != rows_local:
+        raise ValueError(f"sidecar covers {covered} rows, rank range is {rows_local}")
+    return packed_local, scales_local, layout
+
+
+def _attach_gpu_quant_table(
+    embedding: VocabParallelEmbedding,
+    device: torch.device,
+) -> None:
+    """Load the pending sidecar table for this rank into GPU memory.
+
+    Called on the first lookup, not during weight loading: by then the
+    shadows-only int8 mode has released the fp16 dense copies, which is what
+    makes the packed table fit alongside the weights at smaller TP sizes.
+    """
+    quant_dir, rows, width, tp_start, tp_end = embedding._ple_quant_pending
+    packed, scales, layout = _load_gpu_quant_table(
+        quant_dir,
+        rows=rows,
+        width=width,
+        tp_start=tp_start,
+        tp_end=tp_end,
+        device=device,
+    )
+    embedding._ple_quant_q = packed
+    embedding._ple_quant_s = scales
+    embedding._ple_quant_kind = (
+        "fp8" if ("e4m3" in layout and "e2m1" not in layout) else "int4"
+    )
+    embedding._ple_quant_lut = (
+        _e4m3_lut().to(device) if embedding._ple_quant_kind == "fp8" else None
+    )
+    embedding._ple_quant_pending = None
+
+
+def _gpu_quant_lookup(
+    embedding: VocabParallelEmbedding,
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Dequantizing vocab-parallel lookup from the GPU-resident table.
+
+    Mirrors ``VocabParallelEmbedding.forward``: each rank gathers only its own
+    rows, zeroes everything else, then the ranks' contributions are summed.
+    """
+    if getattr(embedding, "_ple_quant_q", None) is None:
+        _attach_gpu_quant_table(embedding, output.device)
+    if embedding.tp_size > 1:
+        masked_ids, input_mask = get_masked_input_and_mask(
+            ngram_ids,
+            embedding.shard_indices.org_vocab_start_index,
+            embedding.shard_indices.org_vocab_end_index,
+            embedding.shard_indices.num_org_vocab_padding,
+            embedding.shard_indices.added_vocab_start_index,
+            embedding.shard_indices.added_vocab_end_index,
+        )
+    else:
+        masked_ids, input_mask = ngram_ids, None
+    flat = masked_ids.reshape(-1).long()
+    packed = embedding._ple_quant_q.index_select(0, flat)
+    if getattr(embedding, "_ple_quant_kind", "int4") == "fp8":
+        scales = embedding._ple_quant_s.index_select(0, flat)
+        rows = embedding._ple_quant_lut[packed.long()] * scales.unsqueeze(-1)
+    else:
+        scales = embedding._ple_quant_s.index_select(0, flat).to(torch.float32)
+        low = (packed & 0xF).to(torch.float32)
+        high = (packed >> 4).to(torch.float32)
+        nibbles = torch.stack((low, high), dim=-1).view(
+            packed.shape[0], embedding.embedding_dim
+        )
+        group = embedding.embedding_dim // scales.shape[1]
+        rows = (nibbles - 8.0) * scales.repeat_interleave(group, dim=1)
+    rows = rows.to(output.dtype).view(*ngram_ids.shape, -1)
+    if input_mask is not None:
+        rows = rows.masked_fill(input_mask.unsqueeze(-1), 0)
+    rows = rows.flatten(-2)
+    if embedding.tp_size > 1:
+        rows = tensor_model_parallel_all_reduce(rows)
+    output.copy_(rows)
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -238,6 +454,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
         )
+        self._ple_gpu_quant_dir = envs.VLLM_PLE_GPU_QUANT or None
+        if self._ple_gpu_quant_dir:
+            if envs.VLLM_PLE_CPU_OFFLOAD:
+                raise ValueError(
+                    "VLLM_PLE_GPU_QUANT and VLLM_PLE_CPU_OFFLOAD are mutually "
+                    "exclusive; the GPU-resident table has no CPU worker"
+                )
+            _stub_gpu_quant_table(self.ngram_embedding)
         self._max_total_tokens = int(max_total_tokens)
         self._max_num_reqs = int(max_num_reqs)
         # ngram_heads_vocab_sizes/offsets are derived from config (primes above),
@@ -481,10 +705,27 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
+        quant_dir = self._ple_gpu_quant_dir
+        if quant_dir:
+            # The table is served from the packed sidecar. Loading is deferred to
+            # the first forward (see _attach_gpu_quant_table). The checkpoint's
+            # bf16 shards are absent by design; report the logical table loaded.
+            embedding = self.ngram_embedding
+            embedding._ple_quant_pending = (
+                quant_dir,
+                embedding.org_vocab_size,
+                embedding.embedding_dim,
+                embedding.shard_indices.org_vocab_start_index,
+                embedding.shard_indices.org_vocab_end_index,
+            )
+            loaded.add("ngram_embedding.weight")
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
+                continue
+            if quant_dir and name == "ngram_embedding.weight_scale":
+                # The deployed int4 path applies no global table scale.
                 continue
             if name in persistent_buffers:
                 buffer = persistent_buffers[name]
@@ -516,6 +757,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         f"PLE embedding shard index {shard_index} exceeds "
                         f"split_ngram_parts={self.split_ngram_parts}"
                     )
+                if quant_dir:
+                    continue
                 embedding = self.ngram_embedding
                 shard_size = (
                     embedding.org_vocab_size + self.split_ngram_parts - 1
@@ -1209,7 +1452,14 @@ def qwen4_exp_amd_ple_ngram_embedding(
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpPLELayer):
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
-    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    embedding = layer.ple_embedding.ngram_embedding
+    if (
+        getattr(embedding, "_ple_quant_q", None) is not None
+        or getattr(embedding, "_ple_quant_pending", None) is not None
+    ):
+        _gpu_quant_lookup(embedding, ngram_ids, output)
+        return
+    result = embedding(ngram_ids).flatten(-2)
     output.copy_(result)
 
 

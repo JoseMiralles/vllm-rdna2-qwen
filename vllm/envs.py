@@ -300,6 +300,7 @@ if TYPE_CHECKING:
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_PLE_DISK_OFFLOAD_DIR: str = ""
     VLLM_PLE_QUANT_DIR: str = ""
+    VLLM_PLE_GPU_QUANT: str = ""
     VLLM_RDNA_DENSE_INT8: bool = False
     VLLM_RDNA_AR: bool = True
     VLLM_RDNA_AR_MAX_KB: int = 64
@@ -2066,6 +2067,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- gfx1030 / RDNA2 fork (docs/rdna2/CHANGES.md) ---
     # int4/fp8 quantized n-gram table sidecar served by the PLE offload worker
     "VLLM_PLE_QUANT_DIR": lambda: os.getenv("VLLM_PLE_QUANT_DIR", ""),
+    # int4 n-gram table sidecar loaded into GPU memory, row-sharded across the
+    # TP ranks (no CPU offload worker). Mutually exclusive with
+    # VLLM_PLE_CPU_OFFLOAD; lookups dequantize in the PLE embedding custom op.
+    "VLLM_PLE_GPU_QUANT": lambda: os.getenv("VLLM_PLE_GPU_QUANT", ""),
     # int8 weight-only shadows of the dense fp16 projections for decode (T45)
     "VLLM_RDNA_DENSE_INT8": lambda: os.getenv("VLLM_RDNA_DENSE_INT8", "0") == "1",
     # push-based one-shot P2P all-reduce for small TP messages (T44)

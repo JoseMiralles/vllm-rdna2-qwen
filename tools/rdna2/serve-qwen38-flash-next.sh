@@ -41,7 +41,11 @@ set -euo pipefail
 # unquantised bf16 table from checkpoint shard 1 via the disk path (PLE_DISK_DIR=<writable dir for the 95 GiB
 # raw table file>; MODEL must then be a directory whose index lists shard 1). First bf16 boot copies the table
 # out of shard 1 into PLE_DISK_DIR; later boots map that file.
-if [ -z "${PLE_DISK_DIR:-}" ]; then
+# PLE_MODE=gpu loads the sidecar's packed table into GPU memory instead, row-sharded across the TP ranks
+# (VLLM_PLE_GPU_QUANT): no CPU offload worker and no host-memory residency; needs a quantised sidecar in
+# PLE_INT4 (int4 group16 or fp8 per-row).
+PLE_MODE="${PLE_MODE:-cpu}"
+if [ -z "${PLE_DISK_DIR:-}" ] || [ "$PLE_MODE" = "gpu" ]; then
   : "${PLE_INT4:?set PLE_INT4 to the ples_int4 sidecar directory (128 shards + META.json)}"
 fi
 GPUS="${GPUS:-1,2,3,4}"
@@ -112,14 +116,21 @@ else
 fi
 
 # --- this fork's features ---------------------------------------------------------------
-# n-gram table served from the int4 sidecar by a CPU worker process (CHANGES.md #3)
-export VLLM_PLE_CPU_OFFLOAD=1
-if [ -n "${PLE_DISK_DIR:-}" ]; then
-  export VLLM_PLE_DISK_OFFLOAD_DIR="$PLE_DISK_DIR"; unset VLLM_PLE_QUANT_DIR
+# n-gram table source (CHANGES.md #3): cpu (default) serves the quantised sidecar from a CPU worker
+# process (or the bf16 disk file with PLE_DISK_DIR); gpu loads the packed sidecar table into GPU
+# memory, row-sharded across the TP ranks, and dequantizes inside the PLE embedding custom op.
+if [ "$PLE_MODE" = "gpu" ]; then
+  export VLLM_PLE_GPU_QUANT="$PLE_INT4"
+  unset VLLM_PLE_QUANT_DIR VLLM_PLE_DISK_OFFLOAD_DIR VLLM_PLE_OFFLOAD_READY_TIMEOUT
 else
-  export VLLM_PLE_QUANT_DIR="$PLE_INT4"
+  export VLLM_PLE_CPU_OFFLOAD=1
+  if [ -n "${PLE_DISK_DIR:-}" ]; then
+    export VLLM_PLE_DISK_OFFLOAD_DIR="$PLE_DISK_DIR"; unset VLLM_PLE_QUANT_DIR
+  else
+    export VLLM_PLE_QUANT_DIR="$PLE_INT4"
+  fi
+  export VLLM_PLE_OFFLOAD_READY_TIMEOUT=3600
 fi
-export VLLM_PLE_OFFLOAD_READY_TIMEOUT=3600
 # int8 shadows of the dense fp16 projections for decode (CHANGES.md #7)
 export VLLM_RDNA_DENSE_INT8="${DENSE_INT8:-1}"
 # DENSE_INT8_ONLY=1: release the fp16 copies of the shadowed dense projections after loading

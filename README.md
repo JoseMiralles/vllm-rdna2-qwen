@@ -1,3 +1,9 @@
+> **Fork note:** This is a fork of [vLLM](https://github.com/vllm-project/vllm) tailored towards an
+> **8-GPU AMD Radeon PRO V620** build, to host **Qwen3.8-Flash-Next**. It is based on
+> [leapdragon/vllm-rdna2-qwen](https://github.com/leapdragon/vllm-rdna2-qwen) and adds a
+> GPU-resident quantised n-gram (PLE) table (`VLLM_PLE_GPU_QUANT`) so the model serves without the
+> CPU-sidecar host-RAM requirement.
+
 This repo is AI slop.
 
 # vLLM for 4× Radeon PRO V620 — Qwen3.8-Flash-Next
