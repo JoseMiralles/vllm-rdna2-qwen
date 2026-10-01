@@ -1,8 +1,32 @@
-> **Fork note:** This is a fork of [vLLM](https://github.com/vllm-project/vllm) tailored towards an
-> **8-GPU AMD Radeon PRO V620** build, to host **Qwen3.8-Flash-Next**. It is based on
-> [leapdragon/vllm-rdna2-qwen](https://github.com/leapdragon/vllm-rdna2-qwen) and adds a
-> GPU-resident quantised n-gram (PLE) table (`VLLM_PLE_GPU_QUANT`) so the model serves without the
-> CPU-sidecar host-RAM requirement.
+# vLLM for 8× Radeon PRO V620 — Qwen3.8-Flash-Next
+
+A fork of [vLLM](https://github.com/vllm-project/vllm), based on
+[leapdragon/vllm-rdna2-qwen](https://github.com/leapdragon/vllm-rdna2-qwen), that serves
+**Qwen3.8-Flash-Next** (176 B parameters) on **eight AMD Radeon PRO V620** cards (Navi 21 /
+gfx1030, 32 GB each) in one box. The model's 51-billion-row n-gram (PLE) table is quantised and
+served **from GPU memory** (`VLLM_PLE_GPU_QUANT`), row-sharded across the eight tensor-parallel
+ranks: no CPU offload worker, no host-RAM residency for the table, and the whole model plus the
+KV pool live in VRAM.
+
+| | |
+|---|---|
+| **Hardware target** | 8× Radeon PRO V620 (gfx1030, 32 GB), tensor parallel across all eight, in one box |
+| **N-gram table** | fp8 per-row sidecar (~52 GB, ~6.6 GB/card) resident in VRAM; int4 group-16 (~32 GB, ~4 GB/card) also supported |
+| **Decode** | **~70 tokens/s** single stream, CUDA graphs, MTP off, at the 140 W / 2300 MHz per-card operating point |
+| **Prefill** | TTFT **~0.3 s**; a 1k-token completion runs at ~67 tokens/s including prefill |
+| **Context** | **100,000 tokens** per session (the model allows 262,144); up to 4 concurrent sessions |
+| **KV pool** | **~790,000 tokens** (~7.9× a full 100k session); KV cache in fp16, not quantised |
+| **Model files** | AWQ W4A16 backbone (full checkpoint, incl. shard 1) + quantised n-gram sidecar (~220 GB of downloads, no conversion) |
+
+**Platform.** The cards run at a steady 140 W cap with a 2300 MHz clock ceiling and −25 mV
+undervolt, applied after every boot by [`hwconfig/cardinit/`](hwconfig/cardinit/) against the
+patched driver in [`hwconfig/kernel-patches/`](hwconfig/kernel-patches/). Inter-GPU traffic uses
+the `wide` one-shot all-reduce and the int8 prefill all-reduce. Host RAM holds only the worker
+processes' working state — the n-gram table and the KV cache are entirely in VRAM.
+
+---
+
+*Everything below this line is the original fork's README for the 4× Radeon PRO V620 build.*
 
 This repo is AI slop.
 
